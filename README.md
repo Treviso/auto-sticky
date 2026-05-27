@@ -26,7 +26,7 @@ When a user submits a new post, the app processes it through a strict step-by-st
 
 1. **Double-Post Protection (Idempotency):** The app immediately checks if it has already processed this exact post. If Reddit delivers the "new post" event more than once (or if a glitch retries the event), the app remembers the post ID and will safely ignore the duplicate, ensuring your users never see double bot comments.
 2. **Sequential Rule Check:** The app reads your custom YAML configurations from top to bottom. If a post meets every requirement listed in a rule (such as matching a specific flair or key phrase in the title), it triggers that specific comment and stops checking.
-3. **Fallback to Catch-All:** If the post does not match any of your custom rules, or if you haven't written any YAML rules yet, the app falls back to your "Catch-All Sticky Comment" text. If that field is also empty, the app ends without posting a comment.
+3. **Fallback to Default** If the post does not match any of your custom rules, or if you haven't written any YAML rules yet, the app falls back to your "Default Comment" text. If that field is also empty, the app ends without posting a comment.
 
 ---
 
@@ -50,7 +50,6 @@ title (ends-with): "?"
 title (full-exact): Exact Post Title Here
 title [regex]: '^\[Discussion\]'
 title [not-regex]: '\bNSFW\b'
-
 ```
 
 *Note: Title text matching is always **case-insensitive**.*
@@ -60,10 +59,9 @@ title [not-regex]: '\bNSFW\b'
 ```yaml
 post_flair_id: 9f2a1b3c-0000-0000-0000-aabbccddeeff   # single ID
 
-post_flair_id:                     # or a list of flairs
+post_flair_id:                   					  # or a list of flairs
   - 9f2a1b3c-0000-0000-0000-aabbccddeeff
   - deadbeef-0000-0000-0000-112233445566
-
 ```
 
 ---
@@ -78,7 +76,6 @@ comment: |
 
 comment_stickied: true    # default: true  — pins as sticked comment
 comment_locked: true      # default: true  — disables public replies
-
 ```
 
 *Note: All comments created by this app are automatically distinguished as a **Moderator** (green shield).*
@@ -118,7 +115,6 @@ comment: |
   **This post was tagged for spoilers.**
 comment_stickied: true
 comment_locked: false
-
 ```
 
 
@@ -128,5 +124,4 @@ comment_locked: false
 Thanks for posting to r/{{subreddit}}, u/{{author}}! 
 
 Please ensure your post aligns with our general guidelines.
-
 ```
