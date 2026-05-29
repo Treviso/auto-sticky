@@ -3,17 +3,21 @@
 // ---------------------------------------------------------------------------
 // Flow:
 //   1. Mod configures rules in the Subreddit Settings page (YAML textarea).
-//   2. An optional catch-all comment (markdown) can be set below the YAML field.
-//   3. When a new post is submitted the PostSubmit trigger fires.
-//   4. We parse the rules, walk them in order (first-match-wins).
-//   5. On a match we post a mod comment and optionally sticky + lock it.
-//   6. If NO rule matched but a catch-all comment is configured, that fires.
-//   7. A Redis key prevents a second comment if the trigger somehow fires twice.
+//   2. An optional catch-all Default Comment can be set for posts that match nothing.
+//   3. An optional Global Footer is appended to every comment the app posts.
+//   4. An optional wiki backup writes all settings to two subreddit wiki pages.
+//   5. When a new post is submitted the PostSubmit trigger fires.
+//   6. We parse the rules, walk them in order (first-match-wins).
+//   7. On a match we post a mod comment and optionally sticky + lock it.
+//   8. If NO rule matched but a Default Comment is configured, that fires instead.
+//   9. The Global Footer (if any) is appended before submitting.
+//  10. A Redis key prevents a second comment if the trigger somehow fires twice.
 // ---------------------------------------------------------------------------
 
 import { Devvit, SettingScope } from '@devvit/public-api';
-import { parseRules, matchPost, expandTemplate } from './rules.js';
+import { parseRules, validateRules, matchPost, expandTemplate } from './rules.js';
 import type { PostSnapshot } from './types.js';
+import { saveSettingsToWikiPage } from './wiki.js';
 
 // ---------------------------------------------------------------------------
 // Devvit capabilities we need
@@ -21,6 +25,7 @@ import type { PostSnapshot } from './types.js';
 Devvit.configure({
   redditAPI: true,
   redis:     true,
+  scheduler: true,
 });
 
 // ---------------------------------------------------------------------------
@@ -31,15 +36,44 @@ Devvit.addSettings([
     type:     'paragraph',
     name:     'rules',
     label:    'Automated Sticky Comments Rules (YAML)',
-    helpText: 'Define rules using YAML. Separate each rule with ---. Supported keys: title (contains/starts-with/ends-with/full-exact/[regex]), post_flair_id.',
+    helpText: 'Define rules using YAML. Separate each rule with ---. Supported condition keys: title (contains/starts-with/ends-with/full-exact/[regex]), body (contains/starts-with/ends-with/full-exact/[regex]), post_flair_id.',
     scope:    SettingScope.Subreddit,
+    onValidate: async (event, context) => {
+      const value = event.value?.trim();
+      if (!value) {
+        // Blank is valid - schedule a backup so the wiki reflects the cleared field
+        await context.scheduler.runJob({
+          name: 'saveSettingsToWikiPage',
+          runAt: new Date(Date.now() + 5000),
+          data: context.userId ? { userId: context.userId } : undefined,
+        });
+        return;
+      }
+      try {
+        validateRules(value);
+      } catch (err) {
+        return err instanceof Error ? `Error in rules: ${err.message}` : 'Error in rules';
+      }
+      await context.scheduler.runJob({
+        name: 'saveSettingsToWikiPage',
+        runAt: new Date(Date.now() + 5000),
+        data: context.userId ? { userId: context.userId } : undefined,
+      });
+    },
   },
   {
     type:     'paragraph',
     name:     'catch_all_comment',
     label:    'Default Comment (optional)',
-    helpText: 'Supports Markdown. If no rules match, this comment will be posted automatically. Leave blank to disable.',
+    helpText: 'If no rules match, this comment will be posted automatically. Supports Markdown. Leave blank to disable.',
     scope:    SettingScope.Subreddit,
+    onValidate: async (_event, context) => {
+      await context.scheduler.runJob({
+        name: 'saveSettingsToWikiPage',
+        runAt: new Date(Date.now() + 5000),
+        data: context.userId ? { userId: context.userId } : undefined,
+      });
+    },
   },
   {
     type:         'boolean',
@@ -57,7 +91,38 @@ Devvit.addSettings([
     defaultValue: true,
     scope:        SettingScope.Subreddit,
   },
+  {
+    type:         'paragraph',
+    name:         'global_footer',
+    label:        'Global Footer',
+    helpText:     'Text appended to every comment posted by this app, whether from a rule match or the Default Comment. It is recommended that you use this to inform your users that the comment was automated. Supports Markdown. Leave blank to disable.',
+    defaultValue: '*I am a bot, and this action was performed automatically. Please [contact the moderators of this subreddit](/message/compose/?to=/r/{{subreddit}}) if you have any questions or concerns.*',
+    scope:        SettingScope.Subreddit,
+    onValidate: async (_event, context) => {
+      await context.scheduler.runJob({
+        name: 'saveSettingsToWikiPage',
+        runAt: new Date(Date.now() + 5000),
+        data: context.userId ? { userId: context.userId } : undefined,
+      });
+    },
+  },
+  {
+    type:         'boolean',
+    name:         'backup_to_wiki',
+    label:        'Backup settings to wiki pages',
+    helpText:     "Backs up YAML rules to the wiki page 'auto-sticky-rules' and all other settings to 'auto-sticky-config'. Both pages are visible to subreddit mods only. The backups are updated whenever the YAML rules, Default Comment, or Global Footer fields are saved. Visit https://old.reddit/r/SUBREDDITNAME/wiki/auto-sticky-config if you already migrated to the new wiki.",
+    defaultValue: false,
+    scope:        SettingScope.Subreddit,
+  },
 ]);
+
+// ---------------------------------------------------------------------------
+// Scheduled job - wiki backup
+// ---------------------------------------------------------------------------
+Devvit.addSchedulerJob({
+  name: 'saveSettingsToWikiPage',
+  onRun: saveSettingsToWikiPage,
+});
 
 // ---------------------------------------------------------------------------
 // PostSubmit trigger - main logic
@@ -71,14 +136,21 @@ Devvit.addTrigger({
     // ------------------------------------------------------------------
     // 1. Fetch the FULL post object to ensure author/subreddit are populated
     // ------------------------------------------------------------------
-    const fullPost = await context.reddit.getPostById(lightPost.id);
+    let fullPost: Awaited<ReturnType<typeof context.reddit.getPostById>>;
+    try {
+      fullPost = await context.reddit.getPostById(lightPost.id);
+    } catch (err) {
+      console.error('[AutoSticky] Failed to fetch post:', err);
+      return;
+    }
 
-     // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
     // 2. Build post snapshot
     // ------------------------------------------------------------------
-const snapshot: PostSnapshot = {
+    const snapshot: PostSnapshot = {
       id:                  fullPost.id,
       title:               fullPost.title,
+      body:                fullPost.body ?? '',
       authorName:          fullPost.authorName ?? 'unknown',
       subredditName:       fullPost.subredditName ?? 'unknown',
       url:                 fullPost.url ?? '',
@@ -92,17 +164,17 @@ const snapshot: PostSnapshot = {
     // ------------------------------------------------------------------
     // 3. Idempotency guard - Redis key expires after 30 days
     // ------------------------------------------------------------------
-    const guardKey = `autosticky:done:${lightPost.id}`; // Updated
+    const guardKey = `autosticky:done:${lightPost.id}`;
     try {
       const already = await context.redis.get(guardKey);
       if (already) {
-        console.log(`[AutoSticky] Post ${lightPost.id} already processed - skipping`); // Updated
+        console.log(`[AutoSticky] Post ${lightPost.id} already processed - skipping`);
         return;
       }
     } catch (err) {
       console.error('[AutoSticky] Redis get error:', err);
-      // Don't abort - proceed, worst case is a duplicate comment which Reddit
-      // itself will deduplicate if sticky slot is taken.
+      // Don't abort - proceed, worst case is a duplicate comment
+      // which Reddit itself should deduplicate if sticky slot is taken.
     }
 
     // ------------------------------------------------------------------
@@ -112,25 +184,27 @@ const snapshot: PostSnapshot = {
     let catchAllText: string | undefined;
     let catchAllStickied: boolean | undefined;
     let catchAllLocked: boolean | undefined;
+    let globalFooter: string | undefined;
     try {
-      [rulesYaml, catchAllText, catchAllStickied, catchAllLocked] = await Promise.all([
+      [rulesYaml, catchAllText, catchAllStickied, catchAllLocked, globalFooter] = await Promise.all([
         context.settings.get<string>('rules'),
         context.settings.get<string>('catch_all_comment'),
         context.settings.get<boolean>('catch_all_stickied'),
         context.settings.get<boolean>('catch_all_locked'),
+        context.settings.get<string>('global_footer'),
       ]);
     } catch (err) {
       console.error('[AutoSticky] Could not read settings:', err);
       return;
     }
 
-   // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
     // 5. Find a matching rule, then fall back to catch-all
     // ------------------------------------------------------------------
     let commentBody: string | undefined;
     let comment_stickied = true;
     let comment_locked = true;
-    let ruleSource: string;
+    let ruleSource = 'unknown';
 
     const hasRules = rulesYaml?.trim();
     const hasCatchAll = catchAllText?.trim();
@@ -165,7 +239,15 @@ const snapshot: PostSnapshot = {
 
     if (!commentBody) return;  // Nothing to post
 
-    console.log(`[AutoSticky] Posting comment on ${fullPost.id} ("${fullPost.title}") via ${ruleSource!}`);
+    // Append the global footer (if configured) to every comment
+    const footerText = globalFooter?.trim()
+      ? expandTemplate(globalFooter.trim(), snapshot)
+      : undefined;
+    if (footerText) {
+      commentBody += `\n\n${footerText}`;
+    }
+
+    console.log(`[AutoSticky] Posting comment on ${fullPost.id} ("${fullPost.title}") via ${ruleSource}`);
 
     // ------------------------------------------------------------------
     // 6. Mark as processed BEFORE acting (prevents race conditions)
@@ -213,72 +295,9 @@ const snapshot: PostSnapshot = {
 
     console.log(
       `[AutoSticky] Done - comment ${comment.id} posted` +
-      ` (sticky=${comment_stickied}, locked=${comment_locked}, via=${ruleSource!})`
+      ` (sticky=${comment_stickied}, locked=${comment_locked}, via=${ruleSource})`
     );
   },
 });
 
 export default Devvit;
-
-// ---------------------------------------------------------------------------
-// Help text shown in the settings UI
-// ---------------------------------------------------------------------------
-const RULES_HELP_TEXT = `\
-Write rules in AutoModerator-style YAML. Separate multiple rules with ---.
-The FIRST matching rule wins; later rules are skipped.
-
-SUPPORTED CONDITIONS
-  title (contains): word            # case-insensitive substring
-  title (not-contains): word
-  title (starts-with): word
-  title (ends-with): word
-  title (full-exact): Exact Title
-  title [regex]: ^\\[Discussion\\]
-  title [not-regex]: pattern
-  post_flair_id: abc-123-def        # flair template UUID
-
-  → Multiple values: use a YAML list
-      title (contains):
-        - help
-        - question
-
-  → Multiple conditions on the same rule are ANDed together.
-
-SUPPORTED ACTIONS
-  comment: |
-    Your sticky comment text here.
-    Supports {{author}}, {{subreddit}}, {{title}}, {{url}}.
-  comment_stickied: true   # default true - pins comment to thread
-  comment_locked: true     # default true - prevents replies
-
-EXAMPLE
----
-title (contains):
-  - [help]
-  - question
-comment: |
-  Hi u/{{author}}! Looks like you need help.
-  Please check the wiki before posting.
-comment_stickied: true
-comment_locked: true
----
-post_flair_id: 9f2a1b3c-xxxx-xxxx-xxxx-000000000000
-comment: |
-  This flair has special rules. See our sidebar.
-comment_stickied: true
-comment_locked: false
-`;
-
-const CATCH_ALL_HELP_TEXT = `\
-Optional. If none of the YAML rules above match a new post, this comment is
-posted. Use the toggles below to control whether it is stickied and/or locked.
-
-Leave empty to do nothing when no rules match.
-
-Supports the same template variables as rules:
-  {{author}}  {{subreddit}}  {{title}}  {{url}}
-
-Example:
-  Thanks for posting, u/{{author}}!
-  Please make sure your post follows our community rules.
-`;

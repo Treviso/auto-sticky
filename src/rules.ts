@@ -2,21 +2,22 @@
 // rules.ts - YAML parsing + post-matching logic
 // ---------------------------------------------------------------------------
 // We intentionally support only the AutoModerator fields that relate to:
-//   • post title  (title (contains|starts-with|ends-with|full-exact|[regex]))
+//   • post title  (title (contains|not-contains|starts-with|ends-with|full-exact|[regex]))
+//   • post body   (body  (contains|not-contains|starts-with|ends-with|full-exact|[regex]))
 //   • post flair  (post_flair_id)
-//   • comment output (comment, comment_locked, comment_sticky)
+//   • comment output (comment, comment_locked, comment_stickied)
 //
 // Every YAML key in the "conditions" section follows AutoModerator naming
-// exactly so that mods can copy/paste existing Automoderator snippets.
+// exactly so that mods can copy/paste existing AutoModerator snippets.
 // ---------------------------------------------------------------------------
 
 import yaml from 'js-yaml';
-import type { Rule, TitleCondition, TitleModifier, PostSnapshot } from './types.js';
+import type { Rule, TextCondition, TextModifier, PostSnapshot } from './types.js';
 
 // ---------------------------------------------------------------------------
-// Key → modifier mapping  (covers every AutoModerator title variant we want)
+// Key → modifier mappings  (cover every AutoModerator variant we support)
 // ---------------------------------------------------------------------------
-const TITLE_KEY_MAP: ReadonlyArray<[string, TitleModifier]> = [
+const TITLE_KEY_MAP: ReadonlyArray<[string, TextModifier]> = [
   ['title (contains)',     'contains'],
   ['title (not-contains)', 'not-contains'],
   ['title (starts-with)',  'starts-with'],
@@ -26,6 +27,18 @@ const TITLE_KEY_MAP: ReadonlyArray<[string, TitleModifier]> = [
   ['title (regex)',        'regex'],      // tolerant alias
   ['title [not-regex]',   'not-regex'],
   ['title (not-regex)',   'not-regex'],   // tolerant alias
+];
+
+const BODY_KEY_MAP: ReadonlyArray<[string, TextModifier]> = [
+  ['body (contains)',     'contains'],
+  ['body (not-contains)', 'not-contains'],
+  ['body (starts-with)',  'starts-with'],
+  ['body (ends-with)',    'ends-with'],
+  ['body (full-exact)',   'full-exact'],
+  ['body [regex]',        'regex'],
+  ['body (regex)',        'regex'],       // tolerant alias
+  ['body [not-regex]',   'not-regex'],
+  ['body (not-regex)',   'not-regex'],    // tolerant alias
 ];
 
 // ---------------------------------------------------------------------------
@@ -57,6 +70,82 @@ export function parseRules(rulesYaml: string): Rule[] {
 
   return rules;
 }
+
+// ---------------------------------------------------------------------------
+// Public: validate a rules YAML string, throwing on any error.
+// Called by the settings onValidate handler so mods see errors inline.
+// Unlike parseRules (which swallows errors at runtime to stay resilient),
+// this function throws on the first problem it finds.
+// ---------------------------------------------------------------------------
+export function validateRules(rulesYaml: string): void {
+  const docs = rulesYaml.split(/^---\s*$/m);
+  let validRuleCount = 0;
+
+  for (const doc of docs) {
+    const trimmed = doc.trim();
+    if (!trimmed) continue;
+
+    // 1. YAML syntax
+    let parsed: unknown;
+    try {
+      parsed = yaml.load(trimmed);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`YAML syntax error: ${msg}`);
+    }
+
+    // Pure-comment blocks produce undefined - skip silently (same as parseRules)
+    if (parsed === undefined || parsed === null) continue;
+
+    if (typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('Each rule block must be a YAML mapping (key: value pairs), not a plain value or list.');
+    }
+
+    const data = parsed as Record<string, unknown>;
+
+    // 2. A comment field is mandatory
+    const commentRaw = data['comment'];
+    if (typeof commentRaw !== 'string' || !commentRaw.trim()) {
+      throw new Error('Every rule must have a non-empty "comment" field.');
+    }
+
+    // 3. At least one condition must be present
+    const hasTitleCondition = TITLE_KEY_MAP.some(([key]) => data[key] !== undefined && data[key] !== null);
+    const hasBodyCondition  = BODY_KEY_MAP.some( ([key]) => data[key] !== undefined && data[key] !== null);
+    const hasFlairCondition = data['post_flair_id'] !== undefined && data['post_flair_id'] !== null;
+    if (!hasTitleCondition && !hasBodyCondition && !hasFlairCondition) {
+      throw new Error('Every rule must have at least one condition (a "title (...)", "body (...)", or "post_flair_id" key).');
+    }
+
+    // 4. Regex patterns must compile (checks both title and body)
+    for (const keyMap of [TITLE_KEY_MAP, BODY_KEY_MAP]) {
+      for (const [key, modifier] of keyMap) {
+        if (modifier !== 'regex' && modifier !== 'not-regex') continue;
+        const val = data[key];
+        if (val === undefined || val === null) continue;
+        const patterns = typeof val === 'string' ? [val] : Array.isArray(val) ? val.map(String) : [String(val)];
+        for (const pattern of patterns) {
+          try {
+            new RegExp(pattern, 'iu');
+          } catch {
+            try {
+              new RegExp(pattern, 'i');
+            } catch {
+              throw new Error(`Invalid regex pattern in "${key}": /${pattern}/`);
+            }
+          }
+        }
+      }
+    }
+
+    validRuleCount++;
+  }
+
+  if (validRuleCount === 0) {
+    throw new Error('No valid rules found. Check that each block has a "comment" field and at least one condition.');
+  }
+}
+
 
 // ---------------------------------------------------------------------------
 // Public: find the first rule that matches a post (first-match-wins)
@@ -99,7 +188,7 @@ function buildRule(data: Record<string, unknown>): Rule | null {
   };
 
   // --- title conditions ---
-  const titleConditions: TitleCondition[] = [];
+  const titleConditions: TextCondition[] = [];
   for (const [key, modifier] of TITLE_KEY_MAP) {
     const val = data[key];
     if (val === undefined || val === null) continue;
@@ -107,6 +196,16 @@ function buildRule(data: Record<string, unknown>): Rule | null {
     if (values.length > 0) titleConditions.push({ modifier, values });
   }
   if (titleConditions.length > 0) rule.title = titleConditions;
+
+  // --- body conditions ---
+  const bodyConditions: TextCondition[] = [];
+  for (const [key, modifier] of BODY_KEY_MAP) {
+    const val = data[key];
+    if (val === undefined || val === null) continue;
+    const values = normaliseStringList(val);
+    if (values.length > 0) bodyConditions.push({ modifier, values });
+  }
+  if (bodyConditions.length > 0) rule.body = bodyConditions;
 
   // --- flair condition ---
   const flairRaw = data['post_flair_id'];
@@ -116,8 +215,8 @@ function buildRule(data: Record<string, unknown>): Rule | null {
   }
 
   // A rule is useless without at least one condition
-  if (!rule.title && !rule.post_flair_id) {
-    console.warn('[AutoSticky] Rule skipped - no conditions (title / post_flair_id)');
+  if (!rule.title && !rule.body && !rule.post_flair_id) {
+    console.warn('[AutoSticky] Rule skipped - no conditions (title / body / post_flair_id)');
     return null;
   }
 
@@ -139,7 +238,16 @@ function ruleMatches(post: PostSnapshot, rule: Rule): boolean {
   // All title conditions must pass (AND semantics, same as AutoModerator)
   if (rule.title) {
     for (const cond of rule.title) {
-      if (!checkTitleCondition(post.title, cond)) return false;
+      if (!checkTextCondition(post.title, cond)) return false;
+    }
+  }
+
+  // All body conditions must pass (AND semantics).
+  // Link/image posts have an empty body - body conditions won't match them
+  // unless a not-contains / not-regex rule is used (same behaviour as AutoModerator).
+  if (rule.body) {
+    for (const cond of rule.body) {
+      if (!checkTextCondition(post.body, cond)) return false;
     }
   }
 
@@ -153,8 +261,8 @@ function ruleMatches(post: PostSnapshot, rule: Rule): boolean {
   return true;
 }
 
-function checkTitleCondition(title: string, cond: TitleCondition): boolean {
-  const lower = title.toLowerCase();
+function checkTextCondition(text: string, cond: TextCondition): boolean {
+  const lower = text.toLowerCase();
 
   switch (cond.modifier) {
     case 'contains':
@@ -175,18 +283,23 @@ function checkTitleCondition(title: string, cond: TitleCondition): boolean {
       return cond.values.some(v => lower === v.toLowerCase());
 
     case 'regex':
-      return cond.values.some(v => safeRegex(v)?.test(title) ?? false);
+      return cond.values.some(v => safeRegex(v)?.test(text) ?? false);
 
     case 'not-regex':
-      return cond.values.every(v => !(safeRegex(v)?.test(title) ?? false));
+      return cond.values.every(v => !(safeRegex(v)?.test(text) ?? false));
   }
 }
 
 function safeRegex(pattern: string): RegExp | null {
+  // Try unicode-aware first, fall back for patterns that aren't u-compatible
   try {
-    return new RegExp(pattern, 'i');
+    return new RegExp(pattern, 'iu');
   } catch {
-    console.error('[AutoSticky] Invalid regex pattern:', pattern);
-    return null;
+    try {
+      return new RegExp(pattern, 'i');
+    } catch {
+      console.error('[AutoSticky] Invalid regex pattern:', pattern);
+      return null;
+    }
   }
 }
