@@ -174,7 +174,7 @@ Any other AutoModerator condition keys will be silently ignored. Always check th
 
 ### This app only posts comments - it can't send DMs/chat requests or take any other actions
 
-AutoModerator can approve, remove, filter, report, and ban. This app **only posts a comment**. The `action`, `action_reason`, `moderator_preview`, and similar AutoModerator action keys are not recognised and will be ignored.
+AutoModerator can approve, remove, filter, report, and ban. This app **only posts a comment**. The `action`, `action_reason`, `set_locked`, and similar AutoModerator action keys are not recognised and will be ignored.
 
 ### `comment_stickied` and `comment_locked` default to `true`
 
